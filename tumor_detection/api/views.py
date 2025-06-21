@@ -13,6 +13,13 @@ import cv2
 import logging
 import sys
 import traceback
+from tensorflow.keras.applications import EfficientNetB7
+from tensorflow.keras import layers, models
+from rest_framework import generics, permissions, status
+from rest_framework.authtoken.models import Token
+from .serializers import UserRegistrationSerializer, LoginSerializer
+from django.contrib.auth import authenticate
+
 
 # Configure logging with more detail
 logging.basicConfig(
@@ -27,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Model paths (using relative paths)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(BASE_DIR, 'models')
-CLASSIFICATION_MODEL_PATH = os.path.join(MODEL_DIR, 'best_effnetb7_model.h5')
+CLASSIFICATION_MODEL_PATH = os.path.join(MODEL_DIR, 'effnetb7_perfect_model.h5')
 SEGMENTATION_MODEL_PATH = os.path.join(MODEL_DIR, 'brain_tumor_segmentation.h5')
 
 logger.info(f"Base directory: {BASE_DIR}")
@@ -68,6 +75,7 @@ def build_unet_architecture():
     
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     return model
+
 
 def load_segmentation_model(model_path):
     """Dedicated loader for segmentation model"""
@@ -127,7 +135,18 @@ def load_classification_model(model_path):
             
             # Try alternative loading method
             logger.info("Attempting alternative loading method...")
-            model = tf.keras.models.load_model(model_path, compile=False)
+            base_model = EfficientNetB7(include_top=False, input_shape=(224, 224, 3), weights='imagenet')
+            base_model.trainable = False
+
+            inputs = layers.Input(shape=(224, 224, 3))
+            x = tf.keras.applications.efficientnet.preprocess_input(inputs)
+            x = base_model(x, training=False)
+            x = layers.GlobalAveragePooling2D()(x)
+            x = layers.Dense(128, activation='relu')(x)
+            x = layers.Dropout(0.3)(x)
+            outputs = layers.Dense(4, activation='softmax')(x)
+            model = models.Model(inputs, outputs)
+            model.load_weights(model_path)
             logger.info("Successfully loaded model with alternative method!")
             return model
             
@@ -135,8 +154,9 @@ def load_classification_model(model_path):
         logger.critical(f"Failed to load classification model: {str(e)}")
         logger.critical(traceback.format_exc())
         logger.critical(f"Python version: {sys.version}")
-        logger.critical(f"TensorFlow version: {tf.__version__}")
+        logger.critical(f"TensorFlow version: {tf.version}")
         return None
+
 
 # Initialize models at startup
 try:
@@ -247,6 +267,7 @@ class TumorAnalysisAPI(APIView):
             logger.info(f"Input shape: {img_array.shape}")
             logger.info(f"Input value range: {np.min(img_array)} to {np.max(img_array)}")
             
+            img_array = tf.keras.applications.efficientnet.preprocess_input(img_array)
             preds = classification_model.predict(img_array, verbose=0)[0]
             logger.info(f"Raw predictions: {preds}")
             logger.info(f"Prediction probabilities: {dict(zip(self.CLASS_NAMES, preds))}")
@@ -364,4 +385,39 @@ class TumorAnalysisAPI(APIView):
         except Exception as e:
             logger.error(f"Visualization failed: {str(e)}")
             logger.error(traceback.format_exc())
-            return None 
+            return None
+
+class RegisterView(generics.CreateAPIView):
+    serializer_class = UserRegistrationSerializer
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.save()
+            token, created = Token.objects.get_or_create(user=user)
+            return Response({
+                "user": serializer.data,
+                "token": token.key
+            }, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class LoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+    serializer_class = LoginSerializer
+
+    def post(self, request):
+        serializer = self.serializer_class(data=request.data)
+        if serializer.is_valid():
+            user = serializer.validated_data['user']
+            token, created = Token.objects.get_or_create(user=user)
+            return Response({
+                "token": token.key,
+                "user": {
+                    "email": user.email,
+                    "full_name": user.full_name,
+                    "hospital_name": user.hospital_name,
+                    "hospital_department": user.hospital_department
+                }
+            })
+        return Response(serializer.errors, status=status.HTTP_401_UNAUTHORIZED)
