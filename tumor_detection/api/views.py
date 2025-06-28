@@ -3,7 +3,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Conv2DTranspose, concatenate
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Conv2DTranspose, concatenate, BatchNormalization, Activation, Add, UpSampling2D, Concatenate
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(BASE_DIR, 'models')
 CLASSIFICATION_MODEL_PATH = os.path.join(MODEL_DIR, 'effnetb7_perfect_model.h5')
-SEGMENTATION_MODEL_PATH = os.path.join(MODEL_DIR, 'brain_tumor_segmentation.h5')
+SEGMENTATION_MODEL_PATH = os.path.join(MODEL_DIR, 'ResUNet-bestSegModel-weights.h5')    
 
 logger.info(f"Base directory: {BASE_DIR}")
 logger.info(f"Model directory: {MODEL_DIR}")
@@ -43,37 +43,78 @@ logger.info(f"Classification model path: {CLASSIFICATION_MODEL_PATH}")
 logger.info(f"Segmentation model path: {SEGMENTATION_MODEL_PATH}")
 
 def build_unet_architecture():
-    """Recreate the exact U-Net architecture used in training"""
-    inputs = Input((256, 256, 1), dtype=tf.float32)
+    """Recreate the exact ResUNet architecture used in training"""
+    def resblock(X, f):
+        X_copy = X  # Copy of input
+        
+        # Main path
+        X = Conv2D(f, kernel_size=(1,1), kernel_initializer='he_normal')(X)
+        X = BatchNormalization()(X)
+        X = Activation('relu')(X)
+        
+        X = Conv2D(f, kernel_size=(3,3), padding='same', kernel_initializer='he_normal')(X)
+        X = BatchNormalization()(X)
+        
+        # Shortcut path
+        X_copy = Conv2D(f, kernel_size=(1,1), kernel_initializer='he_normal')(X_copy)
+        X_copy = BatchNormalization()(X_copy)
+        
+        # Adding the output from main path and short path together
+        X = Add()([X, X_copy])
+        X = Activation('relu')(X)
+        return X
+
+    def upsample_concat(x, skip):
+        X = UpSampling2D((2,2))(x)
+        merge = Concatenate()([X, skip])
+        return merge
+
+    # Input
+    input_shape = (256, 256, 3)
+    X_input = Input(input_shape)
+
+    # Stage 1
+    conv_1 = Conv2D(16, 3, activation='relu', padding='same', kernel_initializer='he_normal')(X_input)
+    conv_1 = BatchNormalization()(conv_1)
+    conv_1 = Conv2D(16, 3, activation='relu', padding='same', kernel_initializer='he_normal')(conv_1)
+    conv_1 = BatchNormalization()(conv_1)
+    pool_1 = MaxPooling2D((2,2))(conv_1)
+
+    # Stage 2
+    conv_2 = resblock(pool_1, 32)
+    pool_2 = MaxPooling2D((2,2))(conv_2)
+
+    # Stage 3
+    conv_3 = resblock(pool_2, 64)
+    pool_3 = MaxPooling2D((2,2))(conv_3)
+
+    # Stage 4
+    conv_4 = resblock(pool_3, 128)
+    pool_4 = MaxPooling2D((2,2))(conv_4)
+
+    # Stage 5 (bottle neck)
+    conv_5 = resblock(pool_4, 256)
+
+    # Upsample Stage 1
+    up_1 = upsample_concat(conv_5, conv_4)
+    up_1 = resblock(up_1, 128)
+
+    # Upsample Stage 2
+    up_2 = upsample_concat(up_1, conv_3)
+    up_2 = resblock(up_2, 64)
+
+    # Upsample Stage 3
+    up_3 = upsample_concat(up_2, conv_2)
+    up_3 = resblock(up_3, 32)
+
+    # Upsample Stage 4
+    up_4 = upsample_concat(up_3, conv_1)
+    up_4 = resblock(up_4, 16)
+
+    # Final output
+    outputs = Conv2D(1, (1,1), kernel_initializer='he_normal', padding='same', activation='sigmoid')(up_4)
     
-    # Downsample path
-    c1 = Conv2D(32, 3, activation='relu', padding='same')(inputs)
-    c1 = Conv2D(32, 3, activation='relu', padding='same')(c1)
-    p1 = MaxPooling2D(2)(c1)
-    
-    c2 = Conv2D(64, 3, activation='relu', padding='same')(p1)
-    c2 = Conv2D(64, 3, activation='relu', padding='same')(c2)
-    p2 = MaxPooling2D(2)(c2)
-    
-    # Bottleneck
-    c3 = Conv2D(128, 3, activation='relu', padding='same')(p2)
-    c3 = Conv2D(128, 3, activation='relu', padding='same')(c3)
-    
-    # Upsample path
-    u4 = Conv2DTranspose(64, 2, strides=2, padding='same')(c3)
-    u4 = concatenate([u4, c2])
-    c4 = Conv2D(64, 3, activation='relu', padding='same')(u4)
-    c4 = Conv2D(64, 3, activation='relu', padding='same')(c4)
-    
-    u5 = Conv2DTranspose(32, 2, strides=2, padding='same')(c4)
-    u5 = concatenate([u5, c1])
-    c5 = Conv2D(32, 3, activation='relu', padding='same')(u5)
-    c5 = Conv2D(32, 3, activation='relu', padding='same')(c5)
-    
-    # Output
-    outputs = Conv2D(1, 1, activation='sigmoid')(c5)
-    
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    model = tf.keras.Model(inputs=X_input, outputs=outputs)
     return model
 
 
@@ -88,22 +129,28 @@ def load_segmentation_model(model_path):
         file_size = os.path.getsize(model_path)
         logger.info(f"Segmentation model file size: {file_size / (1024*1024):.2f} MB")
         
-        # Try loading with minimal configuration
+        # First try: Load as complete model
         try:
-            logger.info("Attempting to load segmentation model with minimal config...")
+            logger.info("Attempting to load as complete model...")
             model = load_model(model_path, compile=False)
-            logger.info("Successfully loaded segmentation model!")
+            logger.info("Successfully loaded segmentation model as complete model!")
             return model
         except Exception as e:
-            logger.error(f"Failed to load with minimal config: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.warning(f"Failed to load as complete model: {str(e)}")
+            logger.warning("Attempting to load as weights file...")
             
-            # Fallback: Try loading with exact architecture
-            logger.info("Attempting fallback with exact training architecture...")
-            model = build_unet_architecture()
-            model.load_weights(model_path)
-            logger.info("Successfully loaded segmentation model with exact architecture!")
-            return model
+            # Second try: Load architecture and weights separately
+            try:
+                logger.info("Building fresh architecture...")
+                model = build_unet_architecture()
+                logger.info("Loading weights...")
+                model.load_weights(model_path)
+                logger.info("Successfully loaded segmentation model with weights!")
+                return model
+            except Exception as e2:
+                logger.error(f"Failed to load weights: {str(e2)}")
+                logger.error(traceback.format_exc())
+                raise
             
     except Exception as e:
         logger.critical(f"Failed to load segmentation model: {str(e)}")
@@ -212,15 +259,15 @@ class TumorAnalysisAPI(APIView):
 
             # Process the image
             img_file = request.FILES['file']
-            img_array, original_img = self._preprocess_image(img_file)
+            img_array_classification, img_array_segmentation, original_img = self._preprocess_image(img_file)
             
             # Classify tumor
-            class_name, confidence = self._classify_tumor(img_array)
+            class_name, confidence = self._classify_tumor(img_array_classification)
             
             # Analyze tumor if present
             analysis = None
             if class_name != 'notumor':
-                analysis = self._analyze_tumor(original_img)
+                analysis = self._analyze_tumor(img_array_segmentation, original_img)
                 if analysis:
                     analysis['visualization'] = self._generate_visualization(
                         original_img, 
@@ -249,13 +296,28 @@ class TumorAnalysisAPI(APIView):
             img = Image.open(img_file).convert('RGB')
             original_img = np.array(img)
             
-            # Resize to match model input size (224x224) while keeping RGB channels
-            img_resized = img.resize((224, 224))
-            img_array = np.array(img_resized, dtype=np.float32)
+            # For classification model
+            img_classification = img.resize((224, 224))
+            img_array_classification = np.array(img_classification, dtype=np.float32)
             
-            # Keep original scaling (0-255) to match training conditions
+            # For segmentation model - match training preprocessing exactly
+            img_segmentation = img.resize((256, 256))
+            img_array_segmentation = np.array(img_segmentation, dtype=np.float64)
+            
+            # Standardize like in training
+            img_array_segmentation -= img_array_segmentation.mean()
+            img_array_segmentation /= img_array_segmentation.std()
+            
             # Add batch dimension for model input
-            return np.expand_dims(img_array, axis=0), original_img
+            img_array_segmentation = np.expand_dims(img_array_segmentation, axis=0)
+            
+            logger.info(f"Classification input shape: {img_array_classification.shape}")
+            logger.info(f"Segmentation input shape: {img_array_segmentation.shape}")
+            logger.info(f"Segmentation input range: {img_array_segmentation.min():.2f} to {img_array_segmentation.max():.2f}")
+            
+            return (np.expand_dims(img_array_classification, axis=0), 
+                   img_array_segmentation,
+                   original_img)
         except Exception as e:
             logger.error(f"Image preprocessing failed: {str(e)}")
             logger.error(traceback.format_exc())
@@ -279,29 +341,21 @@ class TumorAnalysisAPI(APIView):
             logger.error(traceback.format_exc())
             raise
 
-    def _analyze_tumor(self, original_img):
+    def _analyze_tumor(self, img_array_segmentation, original_img):
         """Complete tumor segmentation and analysis"""
         try:
-            # Convert to grayscale for segmentation model
-            if len(original_img.shape) == 3:
-                img_gray = cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
-            else:
-                img_gray = original_img
-                
-            # Resize to 256x256 for segmentation model
-            img = cv2.resize(img_gray, (256, 256))
-            img_normalized = img.astype(np.float32) / 255.0
-            img_normalized = np.expand_dims(img_normalized, axis=[0, -1])
-            
-            logger.info(f"Segmentation input shape: {img_normalized.shape}")
-            
-            # Generate mask
+            # Generate mask using preprocessed input
             try:
-                mask_pred = segmentation_model.predict(img_normalized, verbose=0)
+                logger.info(f"Running segmentation prediction on input shape: {img_array_segmentation.shape}")
+                mask_pred = segmentation_model.predict(img_array_segmentation, verbose=0)
                 logger.info(f"Mask prediction shape: {mask_pred.shape}")
+                logger.info(f"Mask prediction range: {mask_pred.min():.2f} to {mask_pred.max():.2f}")
+                
+                # Threshold the prediction
                 mask = (mask_pred[0,...,0] > 0.5).astype(np.uint8)
             except Exception as e:
                 logger.error(f"Segmentation prediction failed: {str(e)}")
+                logger.error(traceback.format_exc())
                 return None
             
             # Post-processing
